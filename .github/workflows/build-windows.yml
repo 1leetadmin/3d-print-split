@@ -1,10 +1,23 @@
-name: Build Windows app
+name: Build and Release Windows Executable
+
+# Artifact/release filenames are always descriptive, never a static name:
+# - Tag push (real release): the filename IS the tag, so tag with what
+#   changed, e.g. `v1.1.0-click-to-extract-connectors`, not just `v1.1.0`.
+# - Manual run (workflow_dispatch): supply a short "description" slug
+#   summarizing what this build is for testing; it's baked into the
+#   filename along with the date and commit so ad hoc builds stay
+#   identifiable too.
 
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      description:
+        description: "Short slug describing this build (e.g. click-to-extract-connectors)"
+        required: false
+        default: "dev-build"
 
 jobs:
   build-windows:
@@ -24,13 +37,33 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller packaging/app.spec --noconfirm
 
+      - name: Determine descriptive build name
+        id: buildname
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            NAME="STLColorSplitter-${{ github.ref_name }}"
+          else
+            SLUG="${{ github.event.inputs.description }}"
+            SLUG="${SLUG:-dev-build}"
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            DATE=$(date +%Y%m%d)
+            NAME="STLColorSplitter-${DATE}-${SHORT_SHA}-${SLUG}"
+          fi
+          NAME="$(echo "$NAME" | tr ' /' '--')"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Rename executable
+        shell: bash
+        run: cp dist/STLColorSplitter.exe "dist/${{ steps.buildname.outputs.name }}.exe"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: STLColorSplitter-windows
-          path: dist/STLColorSplitter.exe
+          name: ${{ steps.buildname.outputs.name }}
+          path: dist/${{ steps.buildname.outputs.name }}.exe
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/STLColorSplitter.exe
+          files: dist/${{ steps.buildname.outputs.name }}.exe

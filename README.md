@@ -72,6 +72,12 @@ Every push of a `v*` tag builds a fresh Windows release automatically (see
 `.github/workflows/build-windows.yml`); you can also trigger a build manually
 from the repo's Actions tab without cutting a release.
 
+**Tag names are the release filename**, so tag with what changed, not just a
+bare version -- e.g. `v1.1.0-click-to-extract-connectors`, not `v1.1.0`. A
+manual (non-tag) build instead asks for a short description and bakes that,
+plus the date and commit, into the filename -- there's no generic
+"latest build" artifact name anywhere in this pipeline.
+
 ## Install from source
 
 Requires Python 3.10+.
