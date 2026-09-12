@@ -3,6 +3,11 @@
 # Build from the repo root with:
 #   pyinstaller packaging/app.spec
 #
+# Builds a single portable executable (onefile): everything needed to run is
+# packed into one .exe that self-extracts to a temp directory on each launch
+# (a few seconds slower to start than an onedir build, but the download is
+# one file with nothing to unzip).
+#
 # VTK/PyVista and PySide6 both dynamically pull in a lot of submodules and
 # plugin files that PyInstaller's static import scan can't see, so we pull
 # them in wholesale with collect_all rather than chasing hidden-import
@@ -46,8 +51,11 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     [],
-    exclude_binaries=True,
+    exclude_binaries=False,
     name="STLColorSplitter",
     debug=False,
     bootloader_ignore_signals=False,
@@ -58,15 +66,4 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name="STLColorSplitter",
 )

@@ -12,6 +12,7 @@ from typing import Callable, Optional
 
 import numpy as np
 import trimesh
+from scipy.spatial import cKDTree
 
 from app.core.colors import quantize_face_colors
 from app.core.model import ColoredMesh
@@ -121,11 +122,28 @@ def voxelize_and_label(
     if len(voxel_indices) == 0:
         raise ValueError("Voxelization produced no solid voxels; try a finer resolution")
 
-    report(f"Labeling {len(voxel_indices)} voxels by nearest surface color", 0.4)
     homogeneous = np.hstack([voxel_indices.astype(np.float64), np.ones((len(voxel_indices), 1))])
     world_points = (transform @ homogeneous.T).T[:, :3]
 
-    _closest, _dist, triangle_ids = trimesh.proximity.closest_point(mesh, world_points)
+    # Exact point-to-triangle projection (trimesh.proximity.closest_point) is
+    # too slow/memory-hungry once a mesh has hundreds of thousands of faces
+    # and there are hundreds of thousands of voxels to label -- a real-world
+    # painted model easily reaches both. A dense area-weighted surface sample
+    # plus a KDTree nearest-neighbor lookup is dramatically cheaper and, since
+    # voxelization itself already discretizes at a coarser scale, loses
+    # negligible accuracy in practice.
+    # Sample density should track surface/color complexity (face count), not
+    # voxel count -- a simple low-poly mesh voxelized at high resolution
+    # doesn't need hundreds of thousands of samples just because it produced
+    # hundreds of thousands of voxels.
+    n_samples = int(np.clip(len(mesh.faces) * 4, 2_000, 400_000))
+    report(f"Sampling {n_samples} surface points for color lookup", 0.3)
+    sample_points, sample_face_ids = trimesh.sample.sample_surface(mesh, n_samples)
+    tree = cKDTree(sample_points)
+
+    report(f"Labeling {len(voxel_indices)} voxels by nearest surface color", 0.4)
+    _dist, nearest_sample_idx = tree.query(world_points, k=1)
+    triangle_ids = sample_face_ids[nearest_sample_idx]
     voxel_labels = face_labels[triangle_ids]
 
     report("Voxelization complete", 0.6)

@@ -24,16 +24,13 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller packaging/app.spec --noconfirm
 
-      - name: Zip build output
-        run: Compress-Archive -Path dist/STLColorSplitter/* -DestinationPath STLColorSplitter-windows.zip
-
       - uses: actions/upload-artifact@v4
         with:
           name: STLColorSplitter-windows
-          path: STLColorSplitter-windows.zip
+          path: dist/STLColorSplitter.exe
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: STLColorSplitter-windows.zip
+          files: dist/STLColorSplitter.exe

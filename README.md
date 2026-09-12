@@ -38,11 +38,12 @@ generated (see Limitations).
 
 ## Download (Windows, no Python needed)
 
-Go to the [Releases page](https://github.com/1leetadmin/3d-print-split/releases),
-download `STLColorSplitter-windows.zip` from the latest release, extract it,
-and run `STLColorSplitter.exe` inside the extracted folder. The download is
-large (~1.5 GB, mostly VTK/Qt) because everything needed to run is bundled in
--- no Python install required.
+Go to the [Releases page](https://github.com/1leetadmin/3d-print-split/releases)
+and download `STLColorSplitter.exe` from the latest release -- it's a single
+portable executable, nothing to install or extract, just run it. The download
+is large (~1.5 GB, mostly VTK/Qt, all bundled into that one file) and it takes
+a few seconds to start each time since it self-extracts to a temp folder on
+launch -- no Python install required either way.
 
 Every push of a `v*` tag builds a fresh Windows release automatically (see
 `.github/workflows/build-windows.yml`); you can also trigger a build manually
@@ -133,8 +134,8 @@ pip install -r requirements.txt pyinstaller
 pyinstaller packaging/app.spec --noconfirm
 ```
 
-The bundled app folder is written to `dist/STLColorSplitter/`; run
-`STLColorSplitter.exe` inside it directly, or zip the folder to distribute it.
+The portable executable is written to `dist/STLColorSplitter.exe` -- copy that
+one file anywhere to distribute it.
 
 ## Running tests
 

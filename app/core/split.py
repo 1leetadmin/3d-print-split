@@ -49,15 +49,27 @@ def _part_for_label(
     homogeneous = np.hstack([verts_idx, np.ones((len(verts_idx), 1))])
     world_verts = (labeling.transform @ homogeneous.T).T[:, :3]
 
-    # marching_cubes' winding, combined with the grid-to-world transform, does
-    # not reliably come out outward-facing -- fix it so slicers see correct
-    # inside/outside surfaces instead of an inverted (negative-volume) shell.
-    part_mesh = trimesh.Trimesh(
+    raw_mesh = trimesh.Trimesh(
         vertices=world_verts, faces=np.asarray(faces, dtype=np.int64), process=False
     )
-    trimesh.repair.fix_normals(part_mesh, multibody=False)
-    if part_mesh.volume < 0:
-        part_mesh.invert()
+
+    # A color region is frequently many disconnected islands (separate
+    # blobs of the same color), and marching cubes can leave a handful of
+    # non-manifold edges where two islands meet at a single ambiguous
+    # "pinch point" cell. Splitting into connected components and fixing
+    # normals/orientation per component -- each of which is an
+    # unambiguous, individually watertight shell -- then rejoining them
+    # resolves that: rejoined components get their own vertex copies at
+    # the old pinch point instead of one edge shared by both, which is
+    # exactly what makes the combined result manifold again.
+    components = raw_mesh.split(only_watertight=False)
+    if len(components) == 0:
+        components = [raw_mesh]
+    for component in components:
+        trimesh.repair.fix_normals(component, multibody=False)
+        if component.volume < 0:
+            component.invert()
+    part_mesh = components[0] if len(components) == 1 else trimesh.util.concatenate(components)
 
     color = tuple(int(c) for c in palette[label])
     return ColorPart(

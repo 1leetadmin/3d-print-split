@@ -3,7 +3,8 @@ import pytest
 import trimesh
 
 from app.core.model import ColoredMesh
-from app.core.split import split_by_color
+from app.core.split import _part_for_label, split_by_color
+from app.core.voxelize import VoxelLabeling
 
 
 def _colored_stack(n_bands: int, band_size: float = 20.0) -> ColoredMesh:
@@ -104,6 +105,32 @@ def test_touching_objects_each_keep_full_volume():
         mesh = trimesh.Trimesh(vertices=part.vertices, faces=part.faces, process=False)
         assert mesh.is_watertight
         assert mesh.volume == pytest.approx(expected_volume, rel=0.12)
+
+
+def test_ambiguous_diagonal_touch_stays_watertight():
+    """Two solid voxels touching only at a shared corner is the classic
+    marching-cubes topological-ambiguity case: it can leave a non-manifold
+    edge (shared by 3+ faces) where the two "islands" meet, even though the
+    surface has no open boundary. Real color regions on complex models are
+    frequently fragmented into many islands, and any two of them can end up
+    exactly diagonally adjacent like this by chance.
+    """
+    palette = np.array([[200, 100, 50]], dtype=np.uint8)
+    labeling = VoxelLabeling(
+        palette=palette,
+        voxel_indices=np.array([[0, 0, 0], [1, 1, 1]]),
+        voxel_labels=np.array([0, 0]),
+        transform=np.eye(4),
+        grid_shape=(2, 2, 2),
+        pitch=1.0,
+    )
+
+    part = _part_for_label(0, palette, labeling)
+
+    assert part is not None
+    mesh = trimesh.Trimesh(vertices=part.vertices, faces=part.faces, process=False)
+    assert mesh.is_watertight
+    assert mesh.volume > 0
 
 
 def test_single_color_mesh_yields_one_part():
