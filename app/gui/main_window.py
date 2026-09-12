@@ -1,6 +1,7 @@
-"""Main window: click a colored part of the model to cut it away from the
-rest with an auto-sized peg/socket connector, undo/redo each cut, and
-export the finished parts.
+"""Main window: a left pane always shows the untouched original model, a
+right pane is where you click a colored part to select it, cut it away from
+the rest with an auto-sized peg/socket connector, and see extracted parts
+laid out beside the shrinking body. Undo/redo each cut, export when done.
 """
 from __future__ import annotations
 
@@ -49,11 +50,38 @@ def _color_icon(rgb: tuple[int, int, int]) -> QIcon:
     return QIcon(pixmap)
 
 
+def _layout_offsets(body: BodyState, parts: list[ExtractedPart]) -> list[np.ndarray]:
+    """Translation offset per part, laying extracted parts out in a row to
+    the right of the body's own bounding box so they're clearly separated
+    and easy to inspect, instead of overlapping where they were cut from.
+    """
+    if len(body.vertices) == 0:
+        body_extent_x = 0.0
+        cursor_x = 0.0
+    else:
+        body_extent_x = float(body.vertices[:, 0].max() - body.vertices[:, 0].min())
+        cursor_x = float(body.vertices[:, 0].max())
+    margin = max(0.15 * body_extent_x, 5.0)
+    cursor_x += margin
+
+    offsets = []
+    for part in parts:
+        if len(part.vertices) == 0:
+            offsets.append(np.zeros(3))
+            continue
+        part_min_x = float(part.vertices[:, 0].min())
+        part_max_x = float(part.vertices[:, 0].max())
+        dx = cursor_x - part_min_x
+        offsets.append(np.array([dx, 0.0, 0.0]))
+        cursor_x += (part_max_x - part_min_x) + margin
+    return offsets
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("STL Color Splitter")
-        self.resize(1300, 850)
+        self.resize(1500, 850)
 
         self.current_path: str | None = None
         self.project: Project | None = None
@@ -61,7 +89,7 @@ class MainWindow(QMainWindow):
         self.extract_worker: ExtractWorker | None = None
 
         self.pending_selection: np.ndarray | None = None
-        self.showing_original: bool = False
+        self._last_clicked_face: int | None = None
         self._centroid_tree: cKDTree | None = None
         self._centroid_tree_body: BodyState | None = None
 
@@ -69,8 +97,8 @@ class MainWindow(QMainWindow):
 
     # -- UI construction ---------------------------------------------------
     def _build_ui(self) -> None:
-        splitter = QSplitter()
-        self.setCentralWidget(splitter)
+        outer = QSplitter()
+        self.setCentralWidget(outer)
 
         panel = QWidget()
         layout = QVBoxLayout(panel)
@@ -79,10 +107,15 @@ class MainWindow(QMainWindow):
         open_btn.clicked.connect(self.on_open)
         layout.addWidget(open_btn)
 
-        layout.addWidget(QLabel("Voxel resolution (voxels along longest axis):"))
+        layout.addWidget(QLabel("Fallback repair/remesh resolution:"))
         self.voxel_spin = QSpinBox()
         self.voxel_spin.setRange(20, 500)
         self.voxel_spin.setValue(120)
+        self.voxel_spin.setToolTip(
+            "Only used if a cut can't be made by preserving the original surface\n"
+            "(e.g. a badly broken source mesh, or an unusually irregular selection\n"
+            "boundary) -- higher gives a finer fallback result but is slower."
+        )
         layout.addWidget(self.voxel_spin)
 
         layout.addWidget(QLabel("Max colors detected:"))
@@ -102,6 +135,7 @@ class MainWindow(QMainWindow):
             "How far a clicked patch is allowed to grow into neighboring colors.\n"
             "0 = exact color match only. 450 = grabs the whole connected surface."
         )
+        self.tolerance_spin.valueChanged.connect(self.on_tolerance_changed)
         layout.addWidget(self.tolerance_spin)
 
         layout.addWidget(QLabel("Connector style:"))
@@ -123,11 +157,6 @@ class MainWindow(QMainWindow):
         )
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
         layout.addWidget(self.mode_combo)
-
-        self.original_view_btn = QPushButton("Show original")
-        self.original_view_btn.setCheckable(True)
-        self.original_view_btn.toggled.connect(self.on_toggle_original_view)
-        layout.addWidget(self.original_view_btn)
 
         self.extract_btn = QPushButton("Extract selected part")
         self.extract_btn.setEnabled(False)
@@ -163,13 +192,32 @@ class MainWindow(QMainWindow):
         self.log.setReadOnly(True)
         layout.addWidget(self.log)
 
-        panel.setMaximumWidth(380)
-        splitter.addWidget(panel)
+        panel.setMaximumWidth(360)
+        outer.addWidget(panel)
 
-        self.plotter = QtInteractor(splitter)
-        splitter.addWidget(self.plotter)
-        splitter.setStretchFactor(1, 1)
-        self.plotter.enable_point_picking(
+        viewers = QSplitter()
+        left_box = QWidget()
+        left_layout = QVBoxLayout(left_box)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(QLabel("Original (untouched)"))
+        self.left_plotter = QtInteractor(left_box)
+        left_layout.addWidget(self.left_plotter)
+        viewers.addWidget(left_box)
+
+        right_box = QWidget()
+        right_layout = QVBoxLayout(right_box)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(QLabel("Working copy -- click a part to select it"))
+        self.right_plotter = QtInteractor(right_box)
+        right_layout.addWidget(self.right_plotter)
+        viewers.addWidget(right_box)
+
+        viewers.setStretchFactor(0, 1)
+        viewers.setStretchFactor(1, 1)
+        outer.addWidget(viewers)
+        outer.setStretchFactor(1, 1)
+
+        self.right_plotter.enable_point_picking(
             callback=self.on_point_picked,
             picker="cell",
             left_clicking=True,
@@ -196,6 +244,7 @@ class MainWindow(QMainWindow):
         self.current_path = path
         self.project = None
         self.pending_selection = None
+        self._last_clicked_face = None
         self.parts_list.clear()
         self.extract_btn.setEnabled(False)
         self.export_btn.setEnabled(False)
@@ -227,6 +276,14 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(100)
         self.log_message("Model ready -- click a colored part to select it")
         self.statusBar().showMessage("Click a colored part of the model to select it")
+
+        self.left_plotter.clear()
+        body = project.master_body
+        poly = _to_pyvista(body.vertices, body.faces)
+        poly.cell_data["colors"] = body.face_colors
+        self.left_plotter.add_mesh(poly, scalars="colors", rgb=True, show_scalar_bar=False)
+        self.left_plotter.reset_camera()
+
         self.refresh_view()
 
     def on_load_failed(self, message: str) -> None:
@@ -239,35 +296,31 @@ class MainWindow(QMainWindow):
             self.project.independent_mode = self.mode_combo.currentIndex() == 1
 
     # -- Viewing / picking ----------------------------------------------------
-    def refresh_view(self) -> None:
+    def refresh_view(self, keep_camera: bool = False) -> None:
         if self.project is None:
             return
-        self.plotter.clear()
+        camera = self.right_plotter.camera_position if keep_camera else None
+        self.right_plotter.clear()
         self.pending_selection = None
+        self._last_clicked_face = None
         self.extract_btn.setEnabled(False)
 
-        if self.showing_original:
-            body = self.project.master_body
-            poly = _to_pyvista(body.vertices, body.faces)
-            poly.cell_data["colors"] = body.face_colors
-            self.plotter.add_mesh(poly, scalars="colors", rgb=True, show_scalar_bar=False)
-        else:
-            body = self.project.body
-            poly = _to_pyvista(body.vertices, body.faces)
-            poly.cell_data["colors"] = body.face_colors
-            self.plotter.add_mesh(poly, scalars="colors", rgb=True, show_scalar_bar=False)
-            for part in self.project.parts:
-                part_poly = _to_pyvista(part.vertices, part.faces)
-                part_poly.cell_data["colors"] = part.face_colors
-                self.plotter.add_mesh(part_poly, scalars="colors", rgb=True, show_scalar_bar=False)
+        body = self.project.body
+        poly = _to_pyvista(body.vertices, body.faces)
+        poly.cell_data["colors"] = body.face_colors
+        self.right_plotter.add_mesh(poly, scalars="colors", rgb=True, show_scalar_bar=False)
 
-        self.plotter.reset_camera()
+        for part, offset in zip(self.project.parts, _layout_offsets(body, self.project.parts)):
+            part_poly = _to_pyvista(part.vertices + offset, part.faces)
+            part_poly.cell_data["colors"] = part.face_colors
+            self.right_plotter.add_mesh(part_poly, scalars="colors", rgb=True, show_scalar_bar=False)
+
+        if camera is not None:
+            self.right_plotter.camera_position = camera
+        else:
+            self.right_plotter.reset_camera()
         self._invalidate_centroid_cache()
         self.update_parts_list()
-
-    def on_toggle_original_view(self, checked: bool) -> None:
-        self.showing_original = checked
-        self.refresh_view()
 
     def _invalidate_centroid_cache(self) -> None:
         self._centroid_tree = None
@@ -281,14 +334,28 @@ class MainWindow(QMainWindow):
         return self._centroid_tree
 
     def on_point_picked(self, point) -> None:
-        if self.project is None or self.showing_original:
+        if self.project is None:
             return
         body = self.project.body
         tree = self._centroid_tree_for_body(body)
         _dist, face_index = tree.query(np.asarray(point), k=1)
         face_index = int(face_index)
+        if face_index >= len(body.faces):
+            return  # a click landed on an already-extracted part, not the body
+        self._last_clicked_face = face_index
+        self._update_selection()
 
-        mask = self.project.select(face_index, tolerance=float(self.tolerance_spin.value()))
+    def on_tolerance_changed(self) -> None:
+        # Instant feedback: re-run the (cheap) flood-fill and re-highlight
+        # without touching the actual cut, which only happens on Extract.
+        if self._last_clicked_face is not None:
+            self._update_selection()
+
+    def _update_selection(self) -> None:
+        if self.project is None or self._last_clicked_face is None:
+            return
+        body = self.project.body
+        mask = self.project.select(self._last_clicked_face, tolerance=float(self.tolerance_spin.value()))
         self.pending_selection = mask
         self.log_message(f"Selected {int(mask.sum())} faces (tolerance {self.tolerance_spin.value()})")
         self.extract_btn.setEnabled(bool(mask.any()) and not bool(mask.all()))
@@ -297,19 +364,21 @@ class MainWindow(QMainWindow):
     def _show_selection_highlight(self, body: BodyState, mask: np.ndarray) -> None:
         # Redraw the body dim, plus a bright highlight over the selected faces,
         # so the user can see exactly what "Extract" would cut out.
-        self.plotter.clear()
+        camera = self.right_plotter.camera_position
+        self.right_plotter.clear()
         poly = _to_pyvista(body.vertices, body.faces)
         poly.cell_data["colors"] = body.face_colors
-        self.plotter.add_mesh(poly, scalars="colors", rgb=True, show_scalar_bar=False, opacity=0.35)
+        self.right_plotter.add_mesh(poly, scalars="colors", rgb=True, show_scalar_bar=False, opacity=0.35)
         if mask.any():
             highlight_faces = body.faces[mask]
             highlight_poly = _to_pyvista(body.vertices, highlight_faces)
-            self.plotter.add_mesh(highlight_poly, color=HIGHLIGHT_COLOR, show_scalar_bar=False)
-        for part in self.project.parts:
-            part_poly = _to_pyvista(part.vertices, part.faces)
+            self.right_plotter.add_mesh(highlight_poly, color=HIGHLIGHT_COLOR, show_scalar_bar=False)
+        for part, offset in zip(self.project.parts, _layout_offsets(body, self.project.parts)):
+            part_poly = _to_pyvista(part.vertices + offset, part.faces)
             part_poly.cell_data["colors"] = part.face_colors
-            self.plotter.add_mesh(part_poly, scalars="colors", rgb=True, show_scalar_bar=False)
-        self.plotter.render()
+            self.right_plotter.add_mesh(part_poly, scalars="colors", rgb=True, show_scalar_bar=False)
+        self.right_plotter.camera_position = camera
+        self.right_plotter.render()
 
     # -- Extraction ------------------------------------------------------------
     def on_extract_clicked(self) -> None:

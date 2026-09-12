@@ -14,7 +14,11 @@ import trimesh
 
 from app.core.colors import quantize_face_colors
 from app.core.extraction import ConnectorInfo, ExtractionResult, extract_region
-from app.core.meshing import transfer_colors_by_nearest_point, voxel_mask_to_watertight_mesh
+from app.core.meshing import (
+    transfer_colors_by_nearest_point,
+    voxel_mask_to_watertight_mesh,
+    weld_local_topology_defects,
+)
 from app.core.model import ColoredMesh
 from app.core.selection import build_face_adjacency_list, flood_fill_by_color
 from app.core.voxelize import build_processed_trimesh, choose_pitch
@@ -57,13 +61,20 @@ def build_master_body(
     max_colors: int = 8,
     progress_cb: ProgressCB = None,
 ) -> BodyState:
-    """One-time voxelize + reconstruct of the whole model into a single
-    clean watertight solid with the original colors (quantized down to at
-    most ``max_colors``) carried over. Every later extraction cuts from
-    this (or a piece of it), so it only needs to happen once per loaded
-    file, however un-watertight the source mesh is. Quantizing colors here
-    keeps the click flood-fill predictable against a bounded palette
-    instead of a noisy near-continuous one.
+    """Prepare the single starting solid every later extraction cuts from
+    (or a piece of).
+
+    Keeps the model at its **original resolution** whenever possible: a
+    watertight source mesh is used as-is; one with only tiny local topology
+    defects (e.g. sub-millimeter T-junctions from a slicer's per-triangle
+    color-paint subdivision) gets those welded shut without touching
+    anything else; one with genuine small gaps is repaired with
+    surface-preserving hole-filling -- none of these regenerate the
+    surface. Only a source too damaged for all of that falls back to a full
+    voxel remesh, which is watertight-by-construction but blocky at the
+    scale of the chosen voxel resolution. Quantizing colors here keeps the
+    click flood-fill predictable against a bounded palette instead of a
+    noisy near-continuous one.
     """
     def report(msg: str, frac: float) -> None:
         if progress_cb is not None:
@@ -71,30 +82,67 @@ def build_master_body(
 
     report("Cleaning mesh", 0.0)
     mesh = build_processed_trimesh(colored_mesh)
-    pitch = choose_pitch(mesh.vertices, voxels_along_longest)
-
-    report("Voxelizing", 0.2)
-    voxel = mesh.voxelized(pitch=pitch).fill()
-    dense = np.asarray(voxel.matrix, dtype=bool)
-    transform = np.asarray(voxel.transform, dtype=np.float64)
-
-    report("Reconstructing solid", 0.5)
-    vertices, faces = voxel_mask_to_watertight_mesh(dense, transform)
-
-    report("Coloring solid", 0.85)
-    from scipy.spatial import cKDTree
 
     raw_face_colors = np.asarray(mesh.visual.face_colors)[:, :3].astype(np.uint8)
     palette, face_labels = quantize_face_colors(raw_face_colors, max_colors=max_colors)
     face_colors = palette[face_labels]
 
-    n_samples = int(np.clip(len(mesh.faces) * 4, 2_000, 400_000))
-    sample_points, sample_face_ids = trimesh.sample.sample_surface(mesh, n_samples)
-    tree = cKDTree(sample_points)
-    colors = transfer_colors_by_nearest_point(vertices, faces, tree, sample_face_ids, face_colors)
+    if not mesh.is_watertight:
+        report("Repairing tiny topology defects (surface-preserving)", 0.1)
+        mesh, kept_face_mask = weld_local_topology_defects(mesh)
+        trimesh.repair.fix_normals(mesh, multibody=False)
+        face_colors = face_colors[kept_face_mask]
 
-    report("Done", 1.0)
+    if not mesh.is_watertight:
+        report("Repairing small gaps (surface-preserving)", 0.2)
+        pre_fill_mesh = mesh.copy()
+        trimesh.repair.fill_holes(mesh)
+        trimesh.repair.fix_normals(mesh, multibody=False)
+        if len(mesh.faces) != len(pre_fill_mesh.faces):
+            # fill_holes added new cap faces; color them via nearest-point
+            # transfer against the pre-repair mesh/colors (still in
+            # correspondence), since the new faces have no direct match in
+            # the pre-repair per-face coloring, and sampling the mutated
+            # `mesh` itself would return sample face ids that overrun the
+            # length of the pre-repair `face_colors` array.
+            face_colors = _colors_via_nearest_sample(pre_fill_mesh, mesh.vertices, mesh.faces, face_colors)
+
+    if mesh.is_watertight:
+        report("Done (original resolution)", 1.0)
+        colors = face_colors if len(mesh.faces) == len(face_colors) else _colors_via_nearest_sample(
+            mesh, mesh.vertices, mesh.faces, face_colors
+        )
+        return BodyState(vertices=np.asarray(mesh.vertices), faces=np.asarray(mesh.faces, dtype=np.int64), face_colors=colors)
+
+    report(
+        "Mesh has gaps too large to repair without changing its shape -- "
+        "falling back to a voxel remesh (blockier, but always watertight)",
+        0.3,
+    )
+    pitch = choose_pitch(mesh.vertices, voxels_along_longest)
+    voxel = mesh.voxelized(pitch=pitch).fill()
+    dense = np.asarray(voxel.matrix, dtype=bool)
+    transform = np.asarray(voxel.transform, dtype=np.float64)
+
+    report("Reconstructing solid", 0.6)
+    vertices, faces = voxel_mask_to_watertight_mesh(dense, transform)
+
+    report("Coloring solid", 0.9)
+    colors = _colors_via_nearest_sample(mesh, vertices, faces, face_colors)
+
+    report("Done (voxel remesh)", 1.0)
     return BodyState(vertices=vertices, faces=faces, face_colors=colors)
+
+
+def _colors_via_nearest_sample(
+    source_mesh: trimesh.Trimesh, vertices: np.ndarray, faces: np.ndarray, source_face_colors: np.ndarray
+) -> np.ndarray:
+    from scipy.spatial import cKDTree
+
+    n_samples = int(np.clip(len(source_mesh.faces) * 4, 2_000, 400_000))
+    sample_points, sample_face_ids = trimesh.sample.sample_surface(source_mesh, n_samples)
+    tree = cKDTree(sample_points)
+    return transfer_colors_by_nearest_point(vertices, faces, tree, sample_face_ids, source_face_colors)
 
 
 class Project:

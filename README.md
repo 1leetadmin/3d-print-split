@@ -14,28 +14,47 @@ connectors" batch jobs.
 
 ## How the interactive workflow works
 
+The window is split into two views: the **left pane always shows the
+untouched original model**, unaffected by anything you do, so you always
+have something to compare against; the **right pane is your working
+copy**, where clicking, selecting and extracting all happen and update in
+real time.
+
 1. **Load** a colored model: `.3mf` (Bambu Studio/OrcaSlicer/PrusaSlicer
    paint-tool color data, multi-object per-filament files, or
    basematerials/pid per-triangle materials), `.obj`+`.mtl`, `.ply`
    (per-vertex color), or a binary `.stl` using the non-standard RGB555
    color-attribute extension (older Cura, Simplify3D, Materialise Magics).
-2. The whole model is voxelized and reconstructed **once** into a single
-   clean watertight solid with its original colors carried over -- this
-   also repairs any gaps/self-intersections in the source mesh before you
-   start cutting.
-3. **Click** any point on the model. That grows outward from the clicked
-   face into neighboring faces whose color stays within your chosen
-   tolerance, highlighting the patch that would be cut.
-4. **Extract**: the volume under the highlighted patch is separated from
-   the rest via the same voxelize/marching-cubes pipeline, and a
-   peg-and-socket connector is baked directly into both pieces' voxel data
-   at the seam -- sized from the seam's own footprint, oriented along the
-   axis between the two pieces. Because it's generated at the voxel level
-   (not a mesh boolean), both resulting solids are guaranteed watertight,
-   the same guarantee the rest of the pipeline relies on.
+2. The model is prepared **once** into a single starting solid, kept at its
+   **original resolution** whenever possible -- an already-watertight mesh
+   is used as-is, one with only tiny local topology defects (e.g.
+   sub-millimeter artifacts some slicers leave behind at painted color
+   boundaries) gets those welded shut in place, and one with genuine small
+   gaps gets a surface-preserving hole-fill. None of these regenerate the
+   surface, so the result looks exactly as smooth as the source model. Only
+   a mesh too damaged for all of that falls back to a voxel remesh, which is
+   watertight-by-construction but blockier at the scale of the chosen
+   fallback resolution.
+3. **Click** any point on the model in the right pane. That grows outward
+   from the clicked face into neighboring faces whose color stays within
+   your chosen tolerance, instantly highlighting the patch that would be
+   cut -- changing the tolerance re-highlights immediately, before you
+   commit to anything.
+4. **Extract selected part**: the highlighted patch is cut away from the
+   rest, keeping essentially all of each resulting piece's surface as the
+   original geometry -- new triangles only appear right at the seam and the
+   connector, so the cut stays smooth. A correctly-sized peg-and-socket
+   connector is fused into the cut directly, analytically, at the seam
+   (sized and oriented from the seam's own footprint), and both resulting
+   solids are verified watertight before being accepted. If the selection's
+   boundary is too irregular for that (e.g. a highly pixelated or
+   self-touching patch), extraction automatically falls back to a
+   voxel-based cut instead -- blockier at the seam, but always correct and
+   watertight; this never silently produces broken geometry either way. The
+   extracted part is placed to the side of the shrinking body in the right
+   pane so you can see the cut worked correctly.
 5. Repeat on the remaining body for the next part, **undo/redo** any cut,
-   toggle **Show original** to compare against the untouched starting
-   model, and **Export all parts** once you're done.
+   and **Export all parts** once you're done.
 
 ### Extraction modes
 
@@ -96,9 +115,12 @@ pip install -r requirements.txt
 python -m app.main
 ```
 
-Open a model, adjust voxel resolution / max colors / click tolerance /
-connector style as needed, click a part to select it, **Extract selected
-part**, repeat, then **Export all parts…**.
+Open a model, adjust max colors / click tolerance / connector style as
+needed (the "fallback repair/remesh resolution" only matters for a source
+mesh too damaged to keep at full resolution, or a selection boundary too
+irregular for the surface-preserving cut), click a part in the right pane
+to select it, **Extract selected part**, repeat, then **Export all
+parts…**.
 
 ### CLI (bulk split, no connectors, no display needed)
 
@@ -111,17 +133,28 @@ python -m scripts.cli model.3mf --out-dir split_output --voxels 120 --max-colors
 
 Run `python -m scripts.cli --help` for all options.
 
-## Choosing voxel resolution
+## Choosing the fallback resolution
 
-Higher "voxels along longest axis" gives more accurate part boundaries and
-volumes at the cost of slower processing and more memory. Voxelization
-inherently pads each part's surface by roughly one voxel, so volumes/edges
-converge to the true geometry only as resolution increases -- 120-200 is a
-reasonable starting point for most desktop models; drop to 60-80 for a quick
-preview, or go higher for parts with fine color detail.
+The "fallback repair/remesh resolution" setting only comes into play when a
+cut *can't* be made by preserving the original surface -- an unusually
+damaged source mesh, or a selection boundary too irregular for the
+analytic cap (a highly pixelated or self-touching patch). In that case,
+higher "voxels along longest axis" gives more accurate boundaries and
+volumes at the cost of slower processing and more memory; voxelization
+inherently pads a part's surface by roughly one voxel, so results converge
+to the true geometry only as resolution increases. 120-200 is a reasonable
+starting point when it does kick in; drop to 60-80 for a quick preview, or
+go higher for fine color detail. It has no effect at all on a cut that
+succeeds via the normal surface-preserving path, which always matches the
+source model's own resolution.
 
 ## Limitations
 
+- **A very irregular selection boundary falls back to a voxel-based cut**
+  for that one extraction (blockier at the seam, still watertight and
+  correct) -- e.g. a highly pixelated or self-touching color patch on a
+  finely-tessellated real-world mesh. This only affects that specific cut;
+  the master body and every other part stay at full resolution.
 - **PrusaSlicer/Bambu Studio's per-triangle paint format is decoded**, but
   only the common case where a triangle is painted as a single color
   end-to-end; the rare case of a single original triangle split into
@@ -147,9 +180,10 @@ app/
     loaders/         # per-format loaders + format auto-detect
     colors.py        # color quantization
     voxelize.py      # voxelization + nearest-surface color labeling
-    meshing.py       # voxel mask -> watertight mesh (shared by both pipelines)
+    meshing.py       # voxel mask -> watertight mesh; local topology-defect welding
     selection.py     # flood-fill face selection by color tolerance
-    extraction.py    # click-to-extract: cut + bake peg/socket connector
+    surface_cut.py   # surface-preserving cut: boundary caps + analytic connector
+    extraction.py    # click-to-extract: surface cut, falling back to voxel cut
     project.py       # interactive session state: body, parts, undo/redo
     split.py         # bulk per-color marching-cubes reconstruction (CLI)
     export.py        # STL + manifest export for the bulk CLI pipeline

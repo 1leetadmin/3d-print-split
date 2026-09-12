@@ -1,13 +1,22 @@
 """Interactive click-to-extract: cut the volume under a selected surface
 patch away from the rest of a solid, and bake a matching peg/socket
-connector into both pieces (directly into the voxel data, before marching
-cubes) so they can be printed separately and glued back together.
+connector into both pieces, so they can be printed separately and glued
+back together.
 
-Doing the connector as voxels rather than a mesh boolean keeps this on the
-exact same, already-hardened voxelize -> marching-cubes -> per-component
-normal fix pipeline used everywhere else in this app, instead of adding a
-second, much less reliable code path (mesh boolean libraries are notorious
-for failing on real-world, imperfect input).
+Two strategies, tried in order:
+
+1. **Surface-preserving** (``app.core.surface_cut``): keeps the original
+   mesh's own triangles almost everywhere, only generating new geometry for
+   the cut cap and connector. Full original resolution, but relies on the
+   cut boundary being a clean set of simple loops, which an irregular or
+   highly pixelated selection can violate.
+2. **Voxel-based** (this module, below): re-voxelizes the whole body and
+   bakes the connector into the voxel grid before marching cubes. Blockier
+   at the cut (limited by voxel resolution) but always succeeds, since
+   marching cubes on a binary volume is topologically guaranteed to close.
+
+The voxel-based path is the automatic fallback whenever the
+surface-preserving one fails or produces a non-watertight result.
 """
 from __future__ import annotations
 
@@ -18,6 +27,7 @@ import numpy as np
 import trimesh
 
 from app.core.meshing import transfer_colors_by_nearest_point, voxel_mask_to_watertight_mesh
+from app.core.surface_cut import SurfaceCutFailed, cut_mesh_preserving_surface
 from app.core.voxelize import choose_pitch
 
 ProgressCB = Optional[Callable[[str, float], None]]
@@ -169,6 +179,74 @@ def _build_connector(
     return peg_mask, socket_mask, info
 
 
+def _mode_color(colors: np.ndarray) -> np.ndarray:
+    uniq, counts = np.unique(colors, axis=0, return_counts=True)
+    return uniq[np.argmax(counts)]
+
+
+def _try_surface_preserving_cut(
+    body_mesh: trimesh.Trimesh,
+    selected_face_mask: np.ndarray,
+    body_face_colors: np.ndarray,
+    connector_style: str,
+    connector_scale: float,
+    report: Callable[[str, float], None],
+) -> Optional[ExtractionResult]:
+    try:
+        cut = cut_mesh_preserving_surface(body_mesh, selected_face_mask, connector_style, connector_scale)
+    except SurfaceCutFailed as exc:
+        report(f"Surface-preserving cut not possible ({exc}) -- falling back to voxel cut", 0.05)
+        return None
+
+    extracted = trimesh.Trimesh(vertices=cut.extracted_vertices, faces=cut.extracted_faces, process=False)
+    remainder = trimesh.Trimesh(vertices=cut.remainder_vertices, faces=cut.remainder_faces, process=False)
+    trimesh.repair.fix_normals(extracted, multibody=False)
+    trimesh.repair.fix_normals(remainder, multibody=False)
+    if extracted.is_watertight and extracted.volume < 0:
+        extracted.invert()
+    if remainder.is_watertight and remainder.volume < 0:
+        remainder.invert()
+
+    if not extracted.is_watertight or not remainder.is_watertight:
+        report("Surface-preserving cut produced a non-watertight result -- falling back to voxel cut", 0.05)
+        return None
+
+    n_sel = int(selected_face_mask.sum())
+    n_rem = int((~selected_face_mask).sum())
+    extracted_colors = np.vstack(
+        [
+            body_face_colors[selected_face_mask],
+            np.tile(_mode_color(body_face_colors[selected_face_mask]), (len(extracted.faces) - n_sel, 1)),
+        ]
+    )
+    remainder_colors = np.vstack(
+        [
+            body_face_colors[~selected_face_mask],
+            np.tile(_mode_color(body_face_colors[~selected_face_mask]), (len(remainder.faces) - n_rem, 1)),
+        ]
+    )
+
+    connector_info = None
+    if cut.connector is not None:
+        connector_info = ConnectorInfo(
+            style=cut.connector.style,
+            radius_mm=cut.connector.radius_mm,
+            length_mm=cut.connector.length_mm,
+            center_world=cut.connector.center_world,
+            axis_world=cut.connector.axis_world,
+        )
+
+    return ExtractionResult(
+        extracted_vertices=np.asarray(extracted.vertices),
+        extracted_faces=np.asarray(extracted.faces, dtype=np.int64),
+        extracted_face_colors=extracted_colors,
+        remainder_vertices=np.asarray(remainder.vertices),
+        remainder_faces=np.asarray(remainder.faces, dtype=np.int64),
+        remainder_face_colors=remainder_colors,
+        connector=connector_info,
+    )
+
+
 def extract_region(
     body_vertices: np.ndarray,
     body_faces: np.ndarray,
@@ -180,10 +258,10 @@ def extract_region(
     progress_cb: ProgressCB = None,
 ) -> ExtractionResult:
     """Cut the selected surface patch's underlying volume away from the rest
-    of ``body``, adding a matching peg/socket connector at the seam.
+    of ``body``, adding a matching peg/socket connector at the seam. Tries
+    the surface-preserving cut first (see module docstring), falling back to
+    the voxel-based one automatically if that isn't possible.
     """
-    from scipy.spatial import cKDTree  # local import: heavy, only needed here
-
     def report(msg: str, frac: float) -> None:
         if progress_cb is not None:
             progress_cb(msg, frac)
@@ -194,6 +272,48 @@ def extract_region(
         raise ValueError("Selection is empty -- nothing to extract")
     if np.all(selected_face_mask):
         raise ValueError("Selection covers the entire model -- nothing would be left")
+
+    report("Attempting surface-preserving cut", 0.0)
+    body_mesh_for_surface_cut = trimesh.Trimesh(
+        vertices=body_vertices, faces=body_faces, face_colors=body_face_colors, process=False
+    )
+    surface_result = _try_surface_preserving_cut(
+        body_mesh_for_surface_cut, selected_face_mask, body_face_colors, connector_style, connector_scale, report
+    )
+    if surface_result is not None:
+        report("Done (surface-preserving cut)", 1.0)
+        return surface_result
+
+    return _extract_region_voxel(
+        body_vertices,
+        body_faces,
+        body_face_colors,
+        selected_face_mask,
+        voxels_along_longest,
+        connector_style,
+        connector_scale,
+        progress_cb,
+    )
+
+
+def _extract_region_voxel(
+    body_vertices: np.ndarray,
+    body_faces: np.ndarray,
+    body_face_colors: np.ndarray,
+    selected_face_mask: np.ndarray,
+    voxels_along_longest: int,
+    connector_style: str,
+    connector_scale: float,
+    progress_cb: ProgressCB,
+) -> ExtractionResult:
+    """Fallback: re-voxelize the whole body and bake the connector into the
+    voxel grid before marching cubes. See module docstring.
+    """
+    from scipy.spatial import cKDTree  # local import: heavy, only needed here
+
+    def report(msg: str, frac: float) -> None:
+        if progress_cb is not None:
+            progress_cb(msg, frac)
 
     report("Building solid", 0.0)
     body_mesh = trimesh.Trimesh(
