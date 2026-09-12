@@ -1,5 +1,6 @@
-"""Main window: open a colored model, preview it, split it into per-color
-solids, and export each as its own printable STL.
+"""Main window: click a colored part of the model to cut it away from the
+rest with an auto-sized peg/socket connector, undo/redo each cut, and
+export the finished parts.
 """
 from __future__ import annotations
 
@@ -8,10 +9,12 @@ import os
 import numpy as np
 import pyvista as pv
 from pyvistaqt import QtInteractor
-from PySide6.QtCore import Qt
+from scipy.spatial import cKDTree
 from PySide6.QtGui import QColor, QPixmap, QIcon
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -28,10 +31,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.core.export import export_parts
 from app.core.loaders.detect import SUPPORTED_EXTENSIONS
-from app.core.model import ColoredMesh, ColorPart
-from app.gui.workers import LoadWorker, SplitWorker
+from app.core.project import BodyState, ExtractedPart, Project
+from app.gui.workers import ExtractWorker, ProjectLoadWorker
+
+HIGHLIGHT_COLOR = (255, 0, 255)  # magenta, unmissable against any model color
 
 
 def _to_pyvista(vertices: np.ndarray, faces: np.ndarray) -> pv.PolyData:
@@ -49,14 +53,17 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("STL Color Splitter")
-        self.resize(1200, 800)
+        self.resize(1300, 850)
 
-        self.colored_mesh: ColoredMesh | None = None
         self.current_path: str | None = None
-        self.parts: list[ColorPart] = []
-        self.part_actors: list = []
-        self.load_worker: LoadWorker | None = None
-        self.split_worker: SplitWorker | None = None
+        self.project: Project | None = None
+        self.load_worker: ProjectLoadWorker | None = None
+        self.extract_worker: ExtractWorker | None = None
+
+        self.pending_selection: np.ndarray | None = None
+        self.showing_original: bool = False
+        self._centroid_tree: cKDTree | None = None
+        self._centroid_tree_body: BodyState | None = None
 
         self._build_ui()
 
@@ -65,7 +72,6 @@ class MainWindow(QMainWindow):
         splitter = QSplitter()
         self.setCentralWidget(splitter)
 
-        # Left control panel
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
@@ -73,59 +79,111 @@ class MainWindow(QMainWindow):
         open_btn.clicked.connect(self.on_open)
         layout.addWidget(open_btn)
 
-        self.swap_rb_checkbox = QCheckBox("Swap R/B (legacy color-STL files)")
-        layout.addWidget(self.swap_rb_checkbox)
-
         layout.addWidget(QLabel("Voxel resolution (voxels along longest axis):"))
         self.voxel_spin = QSpinBox()
         self.voxel_spin.setRange(20, 500)
         self.voxel_spin.setValue(120)
         layout.addWidget(self.voxel_spin)
 
-        layout.addWidget(QLabel("Max color parts:"))
+        layout.addWidget(QLabel("Max colors detected:"))
         self.max_colors_spin = QSpinBox()
         self.max_colors_spin.setRange(1, 32)
         self.max_colors_spin.setValue(8)
         layout.addWidget(self.max_colors_spin)
 
-        self.split_btn = QPushButton("Split into parts")
-        self.split_btn.setEnabled(False)
-        self.split_btn.clicked.connect(self.on_split)
-        layout.addWidget(self.split_btn)
+        self.swap_rb_checkbox = QCheckBox("Swap R/B (legacy color-STL files)")
+        layout.addWidget(self.swap_rb_checkbox)
+
+        layout.addWidget(QLabel("Click tolerance (color-match sensitivity):"))
+        self.tolerance_spin = QSpinBox()
+        self.tolerance_spin.setRange(0, 450)
+        self.tolerance_spin.setValue(30)
+        self.tolerance_spin.setToolTip(
+            "How far a clicked patch is allowed to grow into neighboring colors.\n"
+            "0 = exact color match only. 450 = grabs the whole connected surface."
+        )
+        layout.addWidget(self.tolerance_spin)
+
+        layout.addWidget(QLabel("Connector style:"))
+        self.connector_style_combo = QComboBox()
+        self.connector_style_combo.addItems(["Auto", "Round peg + hole", "Keyed (D-shaped)", "None"])
+        layout.addWidget(self.connector_style_combo)
+
+        layout.addWidget(QLabel("Connector size:"))
+        self.connector_scale_spin = QDoubleSpinBox()
+        self.connector_scale_spin.setRange(0.3, 3.0)
+        self.connector_scale_spin.setSingleStep(0.1)
+        self.connector_scale_spin.setValue(1.0)
+        layout.addWidget(self.connector_scale_spin)
+
+        layout.addWidget(QLabel("Extraction mode:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(
+            ["Incremental (build up piece by piece)", "Independent (each from original)"]
+        )
+        self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
+        layout.addWidget(self.mode_combo)
+
+        self.original_view_btn = QPushButton("Show original")
+        self.original_view_btn.setCheckable(True)
+        self.original_view_btn.toggled.connect(self.on_toggle_original_view)
+        layout.addWidget(self.original_view_btn)
+
+        self.extract_btn = QPushButton("Extract selected part")
+        self.extract_btn.setEnabled(False)
+        self.extract_btn.clicked.connect(self.on_extract_clicked)
+        layout.addWidget(self.extract_btn)
+
+        undo_row = QHBoxLayout()
+        self.undo_btn = QPushButton("Undo")
+        self.undo_btn.setEnabled(False)
+        self.undo_btn.clicked.connect(self.on_undo)
+        self.redo_btn = QPushButton("Redo")
+        self.redo_btn.setEnabled(False)
+        self.redo_btn.clicked.connect(self.on_redo)
+        undo_row.addWidget(self.undo_btn)
+        undo_row.addWidget(self.redo_btn)
+        layout.addLayout(undo_row)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         layout.addWidget(self.progress_bar)
 
-        layout.addWidget(QLabel("Parts:"))
+        layout.addWidget(QLabel("Extracted parts:"))
         self.parts_list = QListWidget()
-        self.parts_list.itemChanged.connect(self.on_part_visibility_changed)
         layout.addWidget(self.parts_list)
 
-        export_row = QHBoxLayout()
         self.export_btn = QPushButton("Export all parts…")
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self.on_export)
-        export_row.addWidget(self.export_btn)
-        layout.addLayout(export_row)
+        layout.addWidget(self.export_btn)
 
         layout.addWidget(QLabel("Log:"))
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         layout.addWidget(self.log)
 
-        panel.setMaximumWidth(360)
+        panel.setMaximumWidth(380)
         splitter.addWidget(panel)
 
-        # 3D viewer
         self.plotter = QtInteractor(splitter)
         splitter.addWidget(self.plotter)
         splitter.setStretchFactor(1, 1)
+        self.plotter.enable_point_picking(
+            callback=self.on_point_picked,
+            picker="cell",
+            left_clicking=True,
+            show_message=False,
+            show_point=True,
+        )
 
         self.statusBar().showMessage("Open a .3mf, .obj, .ply, or color .stl file to begin")
 
     def log_message(self, msg: str) -> None:
         self.log.appendPlainText(msg)
+
+    def _set_busy(self, busy: bool) -> None:
+        self.centralWidget().setEnabled(not busy)
 
     # -- Loading -------------------------------------------------------------
     def on_open(self) -> None:
@@ -136,124 +194,205 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self.current_path = path
-        self.split_btn.setEnabled(False)
-        self.export_btn.setEnabled(False)
-        self.parts = []
+        self.project = None
+        self.pending_selection = None
         self.parts_list.clear()
+        self.extract_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
+        self.undo_btn.setEnabled(False)
+        self.redo_btn.setEnabled(False)
         self.statusBar().showMessage(f"Loading {os.path.basename(path)} …")
         self.log_message(f"Loading {path}")
+        self.progress_bar.setValue(0)
 
-        self.load_worker = LoadWorker(path, swap_rb=self.swap_rb_checkbox.isChecked())
+        independent = self.mode_combo.currentIndex() == 1
+        self.load_worker = ProjectLoadWorker(
+            path,
+            voxels_along_longest=self.voxel_spin.value(),
+            max_colors=self.max_colors_spin.value(),
+            independent_mode=independent,
+            swap_rb=self.swap_rb_checkbox.isChecked(),
+        )
+        self.load_worker.progress.connect(self.on_load_progress)
         self.load_worker.finished_ok.connect(self.on_loaded)
         self.load_worker.failed.connect(self.on_load_failed)
         self.load_worker.start()
 
-    def on_loaded(self, colored_mesh: ColoredMesh) -> None:
-        self.colored_mesh = colored_mesh
-        n_colors = len(colored_mesh.unique_colors)
-        self.log_message(
-            f"Loaded {len(colored_mesh.faces)} faces, {n_colors} distinct source color(s)"
-        )
-        self.statusBar().showMessage(
-            f"Loaded {os.path.basename(self.current_path or '')} "
-            f"({len(colored_mesh.faces)} faces, {n_colors} colors)"
-        )
-        self.split_btn.setEnabled(True)
+    def on_load_progress(self, msg: str, frac: float) -> None:
+        self.progress_bar.setValue(int(frac * 100))
+        self.statusBar().showMessage(msg)
 
-        self.plotter.clear()
-        poly = _to_pyvista(colored_mesh.vertices, colored_mesh.faces)
-        poly.cell_data["colors"] = colored_mesh.face_colors
-        self.plotter.add_mesh(poly, scalars="colors", rgb=True, show_scalar_bar=False)
-        self.plotter.reset_camera()
+    def on_loaded(self, project: Project) -> None:
+        self.project = project
+        self.progress_bar.setValue(100)
+        self.log_message("Model ready -- click a colored part to select it")
+        self.statusBar().showMessage("Click a colored part of the model to select it")
+        self.refresh_view()
 
     def on_load_failed(self, message: str) -> None:
         self.statusBar().showMessage("Load failed")
         self.log_message(f"ERROR loading file: {message}")
         QMessageBox.critical(self, "Could not load file", message)
 
-    # -- Splitting -------------------------------------------------------------
-    def on_split(self) -> None:
-        if self.colored_mesh is None:
+    def on_mode_changed(self) -> None:
+        if self.project is not None:
+            self.project.independent_mode = self.mode_combo.currentIndex() == 1
+
+    # -- Viewing / picking ----------------------------------------------------
+    def refresh_view(self) -> None:
+        if self.project is None:
             return
-        self.split_btn.setEnabled(False)
-        self.export_btn.setEnabled(False)
-        self.progress_bar.setValue(0)
-        self.statusBar().showMessage("Splitting into color parts…")
-
-        self.split_worker = SplitWorker(
-            self.colored_mesh,
-            voxels_along_longest=self.voxel_spin.value(),
-            max_colors=self.max_colors_spin.value(),
-        )
-        self.split_worker.progress.connect(self.on_split_progress)
-        self.split_worker.finished_ok.connect(self.on_split_done)
-        self.split_worker.failed.connect(self.on_split_failed)
-        self.split_worker.start()
-
-    def on_split_progress(self, msg: str, frac: float) -> None:
-        self.progress_bar.setValue(int(frac * 100))
-        self.statusBar().showMessage(msg)
-
-    def on_split_done(self, parts: list[ColorPart]) -> None:
-        self.parts = parts
-        self.split_btn.setEnabled(True)
-        self.export_btn.setEnabled(bool(parts))
-        self.progress_bar.setValue(100)
-        self.log_message(f"Split into {len(parts)} part(s)")
-        self.statusBar().showMessage(f"Split into {len(parts)} part(s)")
-
         self.plotter.clear()
-        self.parts_list.clear()
-        self.part_actors = []
-        for part in parts:
-            poly = _to_pyvista(part.vertices, part.faces)
-            actor = self.plotter.add_mesh(
-                poly, color=[c / 255 for c in part.color_rgb], show_scalar_bar=False
-            )
-            self.part_actors.append(actor)
+        self.pending_selection = None
+        self.extract_btn.setEnabled(False)
 
-            item = QListWidgetItem(f"#{part.hex_color}  ({part.voxel_count} voxels)")
-            item.setIcon(_color_icon(part.color_rgb))
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked)
-            self.parts_list.addItem(item)
+        if self.showing_original:
+            body = self.project.master_body
+            poly = _to_pyvista(body.vertices, body.faces)
+            poly.cell_data["colors"] = body.face_colors
+            self.plotter.add_mesh(poly, scalars="colors", rgb=True, show_scalar_bar=False)
+        else:
+            body = self.project.body
+            poly = _to_pyvista(body.vertices, body.faces)
+            poly.cell_data["colors"] = body.face_colors
+            self.plotter.add_mesh(poly, scalars="colors", rgb=True, show_scalar_bar=False)
+            for part in self.project.parts:
+                part_poly = _to_pyvista(part.vertices, part.faces)
+                part_poly.cell_data["colors"] = part.face_colors
+                self.plotter.add_mesh(part_poly, scalars="colors", rgb=True, show_scalar_bar=False)
+
         self.plotter.reset_camera()
+        self._invalidate_centroid_cache()
+        self.update_parts_list()
 
-    def on_split_failed(self, message: str) -> None:
-        self.split_btn.setEnabled(True)
-        self.statusBar().showMessage("Split failed")
-        self.log_message(f"ERROR splitting: {message}")
-        QMessageBox.critical(self, "Split failed", message)
+    def on_toggle_original_view(self, checked: bool) -> None:
+        self.showing_original = checked
+        self.refresh_view()
 
-    def on_part_visibility_changed(self, item: QListWidgetItem) -> None:
-        row = self.parts_list.row(item)
-        if 0 <= row < len(self.part_actors):
-            self.part_actors[row].SetVisibility(item.checkState() == Qt.Checked)
-            self.plotter.render()
+    def _invalidate_centroid_cache(self) -> None:
+        self._centroid_tree = None
+        self._centroid_tree_body = None
+
+    def _centroid_tree_for_body(self, body: BodyState) -> cKDTree:
+        if self._centroid_tree_body is not body:
+            centroids = body.vertices[body.faces].mean(axis=1)
+            self._centroid_tree = cKDTree(centroids)
+            self._centroid_tree_body = body
+        return self._centroid_tree
+
+    def on_point_picked(self, point) -> None:
+        if self.project is None or self.showing_original:
+            return
+        body = self.project.body
+        tree = self._centroid_tree_for_body(body)
+        _dist, face_index = tree.query(np.asarray(point), k=1)
+        face_index = int(face_index)
+
+        mask = self.project.select(face_index, tolerance=float(self.tolerance_spin.value()))
+        self.pending_selection = mask
+        self.log_message(f"Selected {int(mask.sum())} faces (tolerance {self.tolerance_spin.value()})")
+        self.extract_btn.setEnabled(bool(mask.any()) and not bool(mask.all()))
+        self._show_selection_highlight(body, mask)
+
+    def _show_selection_highlight(self, body: BodyState, mask: np.ndarray) -> None:
+        # Redraw the body dim, plus a bright highlight over the selected faces,
+        # so the user can see exactly what "Extract" would cut out.
+        self.plotter.clear()
+        poly = _to_pyvista(body.vertices, body.faces)
+        poly.cell_data["colors"] = body.face_colors
+        self.plotter.add_mesh(poly, scalars="colors", rgb=True, show_scalar_bar=False, opacity=0.35)
+        if mask.any():
+            highlight_faces = body.faces[mask]
+            highlight_poly = _to_pyvista(body.vertices, highlight_faces)
+            self.plotter.add_mesh(highlight_poly, color=HIGHLIGHT_COLOR, show_scalar_bar=False)
+        for part in self.project.parts:
+            part_poly = _to_pyvista(part.vertices, part.faces)
+            part_poly.cell_data["colors"] = part.face_colors
+            self.plotter.add_mesh(part_poly, scalars="colors", rgb=True, show_scalar_bar=False)
+        self.plotter.render()
+
+    # -- Extraction ------------------------------------------------------------
+    def on_extract_clicked(self) -> None:
+        if self.project is None or self.pending_selection is None:
+            return
+        style_map = {
+            "Auto": "auto",
+            "Round peg + hole": "round",
+            "Keyed (D-shaped)": "keyed",
+            "None": "none",
+        }
+        style = style_map[self.connector_style_combo.currentText()]
+        name = f"part_{len(self.project.parts) + 1}"
+
+        self._set_busy(True)
+        self.statusBar().showMessage("Extracting…")
+        self.extract_worker = ExtractWorker(
+            self.project,
+            self.pending_selection,
+            name=name,
+            connector_style=style,
+            connector_scale=self.connector_scale_spin.value(),
+        )
+        self.extract_worker.progress.connect(self.on_load_progress)
+        self.extract_worker.finished_ok.connect(self.on_extracted)
+        self.extract_worker.failed.connect(self.on_extract_failed)
+        self.extract_worker.start()
+
+    def on_extracted(self, part: ExtractedPart) -> None:
+        self._set_busy(False)
+        connector_desc = f", {part.connector.style} connector" if part.connector else ", no connector"
+        self.log_message(f"Extracted '{part.name}' ({len(part.faces)} faces{connector_desc})")
+        self.statusBar().showMessage(f"Extracted '{part.name}'")
+        self.export_btn.setEnabled(True)
+        self.refresh_view()
+
+    def on_extract_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self.statusBar().showMessage("Extraction failed")
+        self.log_message(f"ERROR extracting: {message}")
+        QMessageBox.critical(self, "Extraction failed", message)
+
+    def update_parts_list(self) -> None:
+        self.parts_list.clear()
+        if self.project is None:
+            return
+        for part in self.project.parts:
+            connector_desc = part.connector.style if part.connector else "no connector"
+            item = QListWidgetItem(f"{part.name}  ({connector_desc})")
+            item.setIcon(_color_icon(part.dominant_color))
+            self.parts_list.addItem(item)
+        self.undo_btn.setEnabled(self.project.can_undo)
+        self.redo_btn.setEnabled(self.project.can_redo)
+        self.export_btn.setEnabled(bool(self.project.parts))
+
+    # -- Undo/redo -----------------------------------------------------------
+    def on_undo(self) -> None:
+        if self.project is None:
+            return
+        self.project.undo()
+        self.log_message("Undo")
+        self.refresh_view()
+
+    def on_redo(self) -> None:
+        if self.project is None:
+            return
+        self.project.redo()
+        self.log_message("Redo")
+        self.refresh_view()
 
     # -- Export -------------------------------------------------------------
     def on_export(self) -> None:
-        if not self.parts:
+        if self.project is None or not self.project.parts:
             return
         out_dir = QFileDialog.getExistingDirectory(self, "Choose export folder")
         if not out_dir:
             return
-
-        selected = [
-            part
-            for part, row in zip(self.parts, range(self.parts_list.count()))
-            if self.parts_list.item(row).checkState() == Qt.Checked
-        ]
-        if not selected:
-            QMessageBox.warning(self, "Nothing selected", "Check at least one part to export.")
-            return
-
-        manifest_path = export_parts(selected, out_dir)
-        self.log_message(f"Exported {len(selected)} part(s) to {out_dir}")
-        self.statusBar().showMessage(f"Exported {len(selected)} part(s) to {out_dir}")
+        manifest_path = self.project.export_parts(out_dir)
+        self.log_message(f"Exported {len(self.project.parts)} part(s) to {out_dir}")
+        self.statusBar().showMessage(f"Exported to {out_dir}")
         QMessageBox.information(
             self,
             "Export complete",
-            f"Wrote {len(selected)} STL file(s) plus a manifest to:\n{out_dir}\n\n"
-            f"See {os.path.basename(manifest_path)} for per-part details.",
+            f"Wrote {len(self.project.parts)} part(s) plus the remaining body to:\n{out_dir}\n\n"
+            f"See {os.path.basename(manifest_path)} for details.",
         )

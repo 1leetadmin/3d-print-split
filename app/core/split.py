@@ -18,9 +18,9 @@ from typing import Optional
 
 import numpy as np
 import trimesh
-from skimage import measure
 
 from app.core.colors import quantize_face_colors
+from app.core.meshing import voxel_mask_to_watertight_mesh
 from app.core.model import ColorPart, ColoredMesh
 from app.core.voxelize import ProgressCB, VoxelLabeling, choose_pitch, voxelize_and_label
 
@@ -37,45 +37,13 @@ def _part_for_label(
     idx = labeling.voxel_indices[mask]
     dense_color[idx[:, 0], idx[:, 1], idx[:, 2]] = True
 
-    # Pad by one empty voxel on every side so marching cubes always closes
-    # the surface at the volume boundary instead of leaving it open.
-    padded = np.pad(dense_color, 1, mode="constant", constant_values=False)
-
-    verts_idx, faces, _normals, _values = measure.marching_cubes(
-        padded.astype(np.float32), level=0.5
-    )
-    verts_idx -= 1.0  # undo the padding offset, back to labeling.grid index space
-
-    homogeneous = np.hstack([verts_idx, np.ones((len(verts_idx), 1))])
-    world_verts = (labeling.transform @ homogeneous.T).T[:, :3]
-
-    raw_mesh = trimesh.Trimesh(
-        vertices=world_verts, faces=np.asarray(faces, dtype=np.int64), process=False
-    )
-
-    # A color region is frequently many disconnected islands (separate
-    # blobs of the same color), and marching cubes can leave a handful of
-    # non-manifold edges where two islands meet at a single ambiguous
-    # "pinch point" cell. Splitting into connected components and fixing
-    # normals/orientation per component -- each of which is an
-    # unambiguous, individually watertight shell -- then rejoining them
-    # resolves that: rejoined components get their own vertex copies at
-    # the old pinch point instead of one edge shared by both, which is
-    # exactly what makes the combined result manifold again.
-    components = raw_mesh.split(only_watertight=False)
-    if len(components) == 0:
-        components = [raw_mesh]
-    for component in components:
-        trimesh.repair.fix_normals(component, multibody=False)
-        if component.volume < 0:
-            component.invert()
-    part_mesh = components[0] if len(components) == 1 else trimesh.util.concatenate(components)
+    vertices, faces = voxel_mask_to_watertight_mesh(dense_color, labeling.transform)
 
     color = tuple(int(c) for c in palette[label])
     return ColorPart(
         color_rgb=color,
-        vertices=np.asarray(part_mesh.vertices),
-        faces=np.asarray(part_mesh.faces, dtype=np.int64),
+        vertices=vertices,
+        faces=faces,
         voxel_count=voxel_count,
     )
 
