@@ -36,7 +36,19 @@ printing each one in its original orientation and gluing matching surfaces
 back together reproduces the assembled model -- no extra alignment pins are
 generated (see Limitations).
 
-## Install
+## Download (Windows, no Python needed)
+
+Go to the [Releases page](https://github.com/1leetadmin/3d-print-split/releases),
+download `STLColorSplitter-windows.zip` from the latest release, extract it,
+and run `STLColorSplitter.exe` inside the extracted folder. The download is
+large (~1.5 GB, mostly VTK/Qt) because everything needed to run is bundled in
+-- no Python install required.
+
+Every push of a `v*` tag builds a fresh Windows release automatically (see
+`.github/workflows/build-windows.yml`); you can also trigger a build manually
+from the repo's Actions tab without cutting a release.
+
+## Install from source
 
 Requires Python 3.10+.
 
@@ -108,7 +120,21 @@ app/
 scripts/
   cli.py           # headless CLI entry point
 tests/             # pytest suite for app/core (no GUI/display required)
+packaging/
+  app.spec         # PyInstaller spec used by the Windows build workflow
+.github/workflows/
+  build-windows.yml  # builds + releases the Windows .exe
 ```
+
+## Building the Windows executable yourself
+
+```bash
+pip install -r requirements.txt pyinstaller
+pyinstaller packaging/app.spec --noconfirm
+```
+
+The bundled app folder is written to `dist/STLColorSplitter/`; run
+`STLColorSplitter.exe` inside it directly, or zip the folder to distribute it.
 
 ## Running tests
 
